@@ -1,0 +1,5 @@
+.ipynb_checkpoints/
+*.csv
+*.xlsx
+__pycache__/
+.env
