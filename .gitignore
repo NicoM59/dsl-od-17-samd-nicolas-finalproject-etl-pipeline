@@ -3,3 +3,6 @@
 *.xlsx
 __pycache__/
 .env
+data/
+logs/
+PROJECT_CONTEXT.md
