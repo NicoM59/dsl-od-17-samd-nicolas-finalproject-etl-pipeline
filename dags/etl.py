@@ -5,10 +5,10 @@ import json
 import logging
 import os
 import random
-import re
 import shutil
 import pandas as pd
 
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.postgres.operators.postgres import PostgresOperator
@@ -36,15 +36,11 @@ def extract():
 
 def transform(ti):
     temp_path = ti.xcom_pull(task_ids="extract")
-    df = pd.read_csv(temp_path)
-
-    def clean_text(text):
-        text = str(text).lower()
-        text = re.sub(r"[^\w\s]", "", text)   # remove punctuation
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
-
-    df["body"] = df["body"].apply(clean_text)
+    try:
+        df = pd.read_csv(temp_path)
+    except pd.errors.EmptyDataError:
+        logging.info("No records to transform — skipping remaining tasks")
+        raise AirflowSkipException
 
     # Simulate prediction — replace with real model endpoint when available
     df["predicted_class"] = [random.choice(LABELS) for _ in range(len(df))]
@@ -58,18 +54,16 @@ def transform(ti):
 def load(ti):
     transformed_path = ti.xcom_pull(task_ids="transform")
     df = pd.read_csv(transformed_path)
-    df["true_class"] = None  # ground truth not available in this pipeline
-
     pg_hook = PostgresHook(postgres_conn_id=NEON_CONN_ID)
     conn = pg_hook.get_conn()
     cursor = conn.cursor()
 
     buffer = io.StringIO()
-    df[["timestamp", "body", "predicted_class", "true_class"]].to_csv(buffer, index=False, header=False, na_rep="")
+    df[["timestamp", "body", "predicted_class"]].to_csv(buffer, index=False, header=False)
     buffer.seek(0)
 
     cursor.copy_expert(
-        sql="COPY public.predictions (timestamp, body, predicted_class, true_class) FROM STDIN WITH (FORMAT CSV, NULL '')",
+        sql="COPY public.predictions (timestamp, body, predicted_class) FROM STDIN WITH (FORMAT CSV)",
         file=buffer
     )
     conn.commit()
@@ -119,10 +113,10 @@ with DAG("etl", start_date=datetime(2026, 1, 1), schedule_interval="@hourly", ca
         postgres_conn_id=NEON_CONN_ID,
         sql="""
             CREATE TABLE IF NOT EXISTS public.predictions (
-                timestamp   TIMESTAMP,
-                body        TEXT,
-                predicted_class VARCHAR,
-                true_class  VARCHAR
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                timestamp       TIMESTAMP,
+                body            TEXT,
+                predicted_class VARCHAR
             );
         """
     )
