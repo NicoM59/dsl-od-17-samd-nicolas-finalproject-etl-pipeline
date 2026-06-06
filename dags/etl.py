@@ -45,7 +45,7 @@ def validate(data, filename):
     return True
 
 
-def extract(ti, logical_date, **kwargs):
+def extract(ti, run_id, logical_date, **kwargs):
     # --- S3 ---
     prefix = S3_PREFIX_BASE + logical_date.strftime("%Y/%m/%d") + "/"
     s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
@@ -101,7 +101,9 @@ def extract(ti, logical_date, **kwargs):
         raise AirflowSkipException
 
     df = pd.DataFrame(records)
-    temp_path = "/opt/airflow/data/extracted.csv"
+    # run_id-scoped path avoids file collisions when concurrent runs execute (e.g. backfill)
+    safe_run_id = run_id.replace(":", "-").replace("+", "-")
+    temp_path = f"/opt/airflow/data/extracted_{safe_run_id}.csv"
     df.to_csv(temp_path, index=False)
     logging.info(
         "Extracted %d valid records (%d skipped) from s3://%s/%s",
@@ -114,13 +116,14 @@ def extract(ti, logical_date, **kwargs):
     return temp_path  # pushed to XCom automatically
 
 
-def transform(ti):
+def transform(ti, run_id, **kwargs):
     # Placeholder for future transformations (e.g. text cleaning, feature engineering).
     # Data is passed through unchanged until the real model pipeline is wired in.
     temp_path = ti.xcom_pull(task_ids="extract")
     df = pd.read_csv(temp_path)
 
-    transformed_path = "/opt/airflow/data/transformed.csv"
+    safe_run_id = run_id.replace(":", "-").replace("+", "-")
+    transformed_path = f"/opt/airflow/data/transformed_{safe_run_id}.csv"
     df.to_csv(transformed_path, index=False)
     logging.info("Transform passed through %d records unchanged", len(df))
     return transformed_path  # pushed to XCom automatically
@@ -181,10 +184,14 @@ def archive_json(ti):
     # logging.info("Archived %d JSON files to %s", len(processed_files), archive_path)
 
 
-def cleanup():
+def cleanup(run_id, **kwargs):
     # Only reached when all upstream tasks succeeded (default trigger_rule=ALL_SUCCESS).
     # Intermediate files are intentionally kept on failure to allow investigation.
-    for path in ["/opt/airflow/data/extracted.csv", "/opt/airflow/data/transformed.csv"]:
+    safe_run_id = run_id.replace(":", "-").replace("+", "-")
+    for path in [
+        f"/opt/airflow/data/extracted_{safe_run_id}.csv",
+        f"/opt/airflow/data/transformed_{safe_run_id}.csv",
+    ]:
         if os.path.exists(path):
             os.remove(path)
             logging.info("Removed intermediate file %s", path)
