@@ -9,21 +9,24 @@ import pandas as pd
 from airflow import DAG
 from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 
 DATA_JSON_PATH = "/opt/airflow/data/json"
 NEON_CONN_ID = "neon_postgres"
+ARCHIVE_ENABLED = False  # set to True in production
+S3_CONN_ID = "aws_s3"
+S3_BUCKET = "dsl-od-17-samd-nicolas-finalproject"
+S3_PREFIX_BASE = "json_queries/"  # date part appended at runtime: json_queries/YYYY/MM/DD/
 
 # Expected fields and their required types.
 # probability accepts int or float depending on the API response.
 EXPECTED_SCHEMA = {
     "input_text":         str,
     "predicted_disorder": str,
-    "explanation":        dict,
     "probability":        (int, float),
-    "status":             str,
-    "api_source":         str,
+    "timestamp":          str,
 }
 
 
@@ -43,35 +46,55 @@ def validate(data, filename):
 
 
 def extract(ti):
-    json_files = [f for f in sorted(os.listdir(DATA_JSON_PATH)) if f.endswith(".json")]
-    if not json_files:
-        logging.info("No JSON files found in %s — skipping pipeline", DATA_JSON_PATH)
+    # --- S3 ---
+    prefix = S3_PREFIX_BASE + datetime.now().strftime("%Y/%m/%d") + "/"
+    s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+    all_keys = s3_hook.list_keys(bucket_name=S3_BUCKET, prefix=prefix) or []
+    json_keys = sorted(k for k in all_keys if k.endswith(".json"))
+    if not json_keys:
+        logging.info("No JSON files found in s3://%s/%s — skipping pipeline", S3_BUCKET, prefix)
         raise AirflowSkipException
 
-    records = []
-    processed_files = []
+    # --- Local (commented out — kept for local testing without S3) ---
+    # json_files = [f for f in sorted(os.listdir(DATA_JSON_PATH)) if f.endswith(".json")]
+    # if not json_files:
+    #     logging.info("No JSON files found in %s — skipping pipeline", DATA_JSON_PATH)
+    #     raise AirflowSkipException
 
-    for filename in json_files:
+    records = []
+    processed_files = []  # S3: full keys; local: filenames
+
+    # --- S3: iterate over keys, read content directly into memory ---
+    for key in json_keys:
+        filename = os.path.basename(key)
         try:
-            with open(os.path.join(DATA_JSON_PATH, filename)) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+            content = s3_hook.read_key(key=key, bucket_name=S3_BUCKET)
+            data = json.loads(content)
+        except Exception as e:
             logging.warning("%s: could not read file (%s) — skipping", filename, e)
             continue
+
+        # --- Local (commented out) ---
+        # for filename in json_files:
+        #     try:
+        #         with open(os.path.join(DATA_JSON_PATH, filename)) as f:
+        #             data = json.load(f)
+        #     except (json.JSONDecodeError, OSError) as e:
+        #         logging.warning("%s: could not read file (%s) — skipping", filename, e)
+        #         continue
 
         if not validate(data, filename):
             continue
 
         records.append({
             "id":                 os.path.splitext(filename)[0],  # UUID from filename — maps db record back to source file
+            "timestamp":          data["timestamp"],
             "input_text":         data["input_text"],
             "predicted_disorder": data["predicted_disorder"],
-            "explanation":        json.dumps(data["explanation"]),  # nested object serialised as a JSON string
             "probability":        data["probability"],
-            "status":             data["status"],
-            "api_source":         data["api_source"],
         })
-        processed_files.append(filename)
+        processed_files.append(key)      # S3: store full key for archive task
+        # processed_files.append(filename) # Local: store filename for archive task
 
     if not records:
         logging.info("No valid JSON files found — skipping pipeline")
@@ -81,11 +104,12 @@ def extract(ti):
     temp_path = "/opt/airflow/data/extracted.csv"
     df.to_csv(temp_path, index=False)
     logging.info(
-        "Extracted %d valid records (%d skipped) from %s",
-        len(records), len(json_files) - len(records), DATA_JSON_PATH
+        "Extracted %d valid records (%d skipped) from s3://%s/%s",
+        len(records), len(json_keys) - len(records), S3_BUCKET, prefix
     )
+    # logging.info("Extracted %d valid records (%d skipped) from %s", len(records), len(json_files) - len(records), DATA_JSON_PATH)  # Local
 
-    # Push the list of valid filenames so archive_json only moves successfully processed files
+    # Push the list of valid keys/filenames so archive_json only moves successfully processed files
     ti.xcom_push(key="processed_files", value=processed_files)
     return temp_path  # pushed to XCom automatically
 
@@ -111,13 +135,13 @@ def load(ti):
     cursor = conn.cursor()
 
     buffer = io.StringIO()
-    df[["id", "input_text", "predicted_disorder", "explanation", "probability", "status", "api_source"]].to_csv(
+    df[["id", "timestamp", "input_text", "predicted_disorder", "probability"]].to_csv(
         buffer, index=False, header=False
     )
     buffer.seek(0)
 
     cursor.copy_expert(
-        sql="COPY public.predictions (id, input_text, predicted_disorder, explanation, probability, status, api_source) FROM STDIN WITH (FORMAT CSV)",
+        sql="COPY public.predictions (id, timestamp, input_text, predicted_disorder, probability) FROM STDIN WITH (FORMAT CSV)",
         file=buffer
     )
     conn.commit()
@@ -128,14 +152,33 @@ def load(ti):
 
 def archive_json(ti):
     # Only move files that passed validation — non-compliant files stay in place for inspection
+    if not ARCHIVE_ENABLED:
+        logging.info("Archiving disabled (ARCHIVE_ENABLED=False) — files left in place")
+        return
     processed_files = ti.xcom_pull(task_ids="extract", key="processed_files")
     if not processed_files:
         return
-    archive_path = os.path.join(DATA_JSON_PATH, "archived")
-    os.makedirs(archive_path, exist_ok=True)
-    for filename in processed_files:
-        shutil.move(os.path.join(DATA_JSON_PATH, filename), os.path.join(archive_path, filename))
-    logging.info("Archived %d JSON files to %s", len(processed_files), archive_path)
+
+    # --- S3: copy each key to archived/ prefix then delete the original ---
+    s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+    for key in processed_files:
+        filename = os.path.basename(key)
+        archive_key = os.path.dirname(key) + "/archived/" + filename
+        s3_hook.copy_object(
+            source_bucket_key=key,
+            dest_bucket_key=archive_key,
+            source_bucket_name=S3_BUCKET,
+            dest_bucket_name=S3_BUCKET
+        )
+        s3_hook.delete_objects(bucket=S3_BUCKET, keys=[key])
+    logging.info("Archived %d JSON files on s3://%s", len(processed_files), S3_BUCKET)
+
+    # --- Local (commented out) ---
+    # archive_path = os.path.join(DATA_JSON_PATH, "archived")
+    # os.makedirs(archive_path, exist_ok=True)
+    # for filename in processed_files:
+    #     shutil.move(os.path.join(DATA_JSON_PATH, filename), os.path.join(archive_path, filename))
+    # logging.info("Archived %d JSON files to %s", len(processed_files), archive_path)
 
 
 def cleanup():
@@ -147,7 +190,7 @@ def cleanup():
             logging.info("Removed intermediate file %s", path)
 
 
-with DAG("etl", start_date=datetime(2026, 1, 1), schedule_interval="@hourly", catchup=False) as dag:
+with DAG("etl", start_date=datetime(2026, 6, 1), schedule_interval="@daily", catchup=True) as dag:
 
     ### Task 1: Read JSON files from data/json, validate each against the expected schema,
     ### and compile valid records into a DataFrame.
@@ -174,12 +217,10 @@ with DAG("etl", start_date=datetime(2026, 1, 1), schedule_interval="@hourly", ca
         sql="""
             CREATE TABLE IF NOT EXISTS public.predictions (
                 id                  UUID PRIMARY KEY,
+                timestamp           TIMESTAMP,
                 input_text          TEXT,
                 predicted_disorder  VARCHAR,
-                explanation         TEXT,
-                probability         FLOAT,
-                status              VARCHAR,
-                api_source          TEXT
+                probability         FLOAT
             );
         """
     )
