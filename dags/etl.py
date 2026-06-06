@@ -45,9 +45,9 @@ def validate(data, filename):
     return True
 
 
-def extract(ti):
+def extract(ti, logical_date, **kwargs):
     # --- S3 ---
-    prefix = S3_PREFIX_BASE + datetime.now().strftime("%Y/%m/%d") + "/"
+    prefix = S3_PREFIX_BASE + logical_date.strftime("%Y/%m/%d") + "/"
     s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
     all_keys = s3_hook.list_keys(bucket_name=S3_BUCKET, prefix=prefix) or []
     json_keys = sorted(k for k in all_keys if k.endswith(".json"))
@@ -190,7 +190,7 @@ def cleanup():
             logging.info("Removed intermediate file %s", path)
 
 
-with DAG("etl", start_date=datetime(2026, 6, 1), schedule_interval="@daily", catchup=True) as dag:
+with DAG("etl", start_date=datetime(2026, 6, 1), schedule_interval="@daily", catchup=False) as dag:
 
     ### Task 1: Read JSON files from data/json, validate each against the expected schema,
     ### and compile valid records into a DataFrame.
