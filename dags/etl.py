@@ -197,7 +197,7 @@ def cleanup(run_id, **kwargs):
             logging.info("Removed intermediate file %s", path)
 
 
-with DAG("etl", start_date=datetime(2026, 6, 1), schedule_interval="@daily", catchup=False) as dag:
+with DAG("etl", start_date=datetime(2026, 6, 1), schedule_interval="@daily", catchup=True) as dag:
 
     ### Task 1: Read JSON files from data/json, validate each against the expected schema,
     ### and compile valid records into a DataFrame.
