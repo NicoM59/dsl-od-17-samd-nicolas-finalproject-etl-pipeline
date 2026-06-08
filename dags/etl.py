@@ -15,7 +15,7 @@ from airflow.providers.postgres.operators.postgres import PostgresOperator
 
 DATA_JSON_PATH = "/opt/airflow/data/json"
 NEON_CONN_ID = "neon_postgres"
-ARCHIVE_ENABLED = False  # set to True in production
+ARCHIVE_ENABLED = True  # set to True in production
 S3_CONN_ID = "aws_s3"
 S3_BUCKET = "dsl-od-17-samd-nicolas-finalproject"
 S3_PREFIX_BASE = "json_queries/"  # date part appended at runtime: json_queries/YYYY/MM/DD/
